@@ -1,0 +1,63 @@
+#!/bin/sh
+# ══════════════════════════════════════════════════════════════════
+# ##  VOID Stress iSH — launcher
+# ##  sh ddos.sh   ← works on ash / iSH / Alpine
+# ══════════════════════════════════════════════════════════════════
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+R='\033[1;31m'
+G='\033[1;32m'
+Y='\033[1;33m'
+C='\033[1;36m'
+W='\033[1;37m'
+D='\033[2m'
+RST='\033[0m'
+BLOOD='\033[38;5;160m'
+
+printf '\n%b' "${BLOOD}"
+printf '══════════════════════════════════════════\n'
+printf '   VOID STRESS — iSH Setup & Launch\n'
+printf '══════════════════════════════════════════\n'
+printf '%b\n' "${RST}"
+
+# ── 1. python3 ────────────────────────────────────────────────
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '%b  Installing python3...%b\n' "${Y}" "${RST}"
+  apk add python3 --no-progress -q
+fi
+PY=$(python3 --version 2>&1)
+printf '%b✔%b  %s\n' "${G}" "${RST}" "$PY"
+
+# ── 2. pip3 ───────────────────────────────────────────────────
+if ! command -v pip3 >/dev/null 2>&1 && ! python3 -m pip --version >/dev/null 2>&1; then
+  printf '%b  Installing pip...%b\n' "${Y}" "${RST}"
+  apk add py3-pip --no-progress -q
+fi
+printf '%b✔%b  pip ready\n' "${G}" "${RST}"
+
+# ── 3. python packages ─────────────────────────────────────────
+install_pkg() {
+  pkg="$1"
+  python3 -c "import $pkg" >/dev/null 2>&1 && return 0
+  printf '%b  Installing %s...%b\n' "${Y}" "$pkg" "${RST}"
+  pip3 install "$pkg" -q 2>/dev/null \
+    || python3 -m pip install "$pkg" -q 2>/dev/null \
+    || { printf '%b✘  Failed to install %s%b\n' "${R}" "$pkg" "${RST}"; return 1; }
+  printf '%b✔%b  %s installed\n' "${G}" "${RST}" "$pkg"
+}
+
+install_pkg rich
+install_pkg requests
+
+printf '\n%b══════════════════════════════════════════%b\n\n' "${BLOOD}" "${RST}"
+
+# ── 4. launch ─────────────────────────────────────────────────
+if [ -f "${DIR}/ddos.py" ]; then
+  python3 "${DIR}/ddos.py"
+elif [ -f "${DIR}/void_stress_ish.py" ]; then
+  python3 "${DIR}/void_stress_ish.py"
+else
+  printf '%b✘  ddos.py not found in %s%b\n' "${R}" "${DIR}" "${RST}"
+  exit 1
+fi
