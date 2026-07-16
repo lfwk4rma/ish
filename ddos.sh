@@ -61,3 +61,4 @@ else
   printf '%b✘  ddos.py not found in %s%b\n' "${R}" "${DIR}" "${RST}"
   exit 1
 fi
+
